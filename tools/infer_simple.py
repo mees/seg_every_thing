@@ -51,6 +51,13 @@ c2_utils.import_detectron_ops()
 # thread safe and causes unwanted GPU memory allocations.
 cv2.ocl.setUseOpenCL(False)
 
+import rospy
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge, CvBridgeError
+from rospy_tutorials.msg import Floats
+from rospy.numpy_msg import numpy_msg
+import numpy as np
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description='End-to-end inference')
@@ -103,56 +110,65 @@ def parse_args():
     return parser.parse_args()
 
 
-def main(args):
-    logger = logging.getLogger(__name__)
-    merge_cfg_from_file(args.cfg)
-    cfg.NUM_GPUS = 1
-    args.weights = cache_url(args.weights, cfg.DOWNLOAD_CACHE)
-    assert_and_infer_cfg(cache_urls=False)
-    model = infer_engine.initialize_model_from_cfg(args.weights)
-    dummy_coco_dataset = (
-        dummy_datasets.get_vg3k_dataset()
-        if args.use_vg3k else dummy_datasets.get_coco_dataset())
-
-    if os.path.isdir(args.im_or_folder):
-        im_list = glob.iglob(args.im_or_folder + '/*.' + args.image_ext)
-    else:
-        im_list = [args.im_or_folder]
-
-    for i, im_name in enumerate(im_list):
-        out_name = os.path.join(
-            args.output_dir, '{}'.format(os.path.basename(im_name) + '.pdf')
-        )
-        logger.info('Processing {} -> {}'.format(im_name, out_name))
-        im = cv2.imread(im_name)
+class kinect_segmenter:
+    def callback(self, data):
+        self.logger.info('Processing {} -> {}')
+        #        print("converting ros img to cv2 and passing it to maskrcnn")
+        self.bridge = CvBridge()
+        im = self.bridge.imgmsg_to_cv2(data, "bgr8")
         timers = defaultdict(Timer)
         t = time.time()
         with c2_utils.NamedCudaScope(0):
             cls_boxes, cls_segms, cls_keyps = infer_engine.im_detect_all(
-                model, im, None, timers=timers
+                self.model, im, None, timers=timers
             )
-        logger.info('Inference time: {:.3f}s'.format(time.time() - t))
+        self.logger.info('Inference time: {:.3f}s'.format(time.time() - t))
         for k, v in timers.items():
-            logger.info(' | {}: {:.3f}s'.format(k, v.average_time))
-        if i == 0:
-            logger.info(
-                ' \ Note: inference on the first image will be slower than the '
-                'rest (caches and auto-tuning need to warm up)'
-            )
+            self.logger.info(' | {}: {:.3f}s'.format(k, v.average_time))
 
-        vis_utils.vis_one_image(
+        result = vis_utils.vis_one_image(
             im[:, :, ::-1],  # BGR -> RGB for visualization
-            im_name,
+            "my_test",
             args.output_dir,
             cls_boxes,
             cls_segms,
             cls_keyps,
-            dataset=dummy_coco_dataset,
+            dataset=self.dummy_coco_dataset,
             box_alpha=0.3,
             show_class=True,
             thresh=args.thresh,
             kp_thresh=2
         )
+        try:
+            self.image_pub.publish(self.bridge.cv2_to_imgmsg(result[0], "bgr8"))
+            self.pub_bbox.publish(result[1].astype(np.float32))
+        except CvBridgeError as e:
+            print(e)
+
+    def __init__(self, args):
+        self.image_pub = rospy.Publisher("/segmented_mug_rgb", Image, queue_size=10)
+        self.bridge = CvBridge()
+        rospy.Subscriber("/camera/rgb/image_rect_color", Image, self.callback)
+        self.pub_bbox = rospy.Publisher('bbox', numpy_msg(Floats), queue_size=10)
+        self.logger = logging.getLogger(__name__)
+        merge_cfg_from_file(args.cfg)
+        cfg.NUM_GPUS = 1
+        args.weights = cache_url(args.weights, cfg.DOWNLOAD_CACHE)
+        assert_and_infer_cfg(cache_urls=False)
+        self.model = infer_engine.initialize_model_from_cfg(args.weights)
+        self.dummy_coco_dataset = (
+            dummy_datasets.get_vg3k_dataset()
+            if args.use_vg3k else dummy_datasets.get_coco_dataset())
+
+
+def main(args):
+    kc = kinect_segmenter(args)
+    rospy.init_node('segment_kinect', anonymous=True)
+    try:
+        rospy.spin()
+    except KeyboardInterrupt:
+        print("Shutting down")
+    cv2.destroyAllWindows()
 
 
 if __name__ == '__main__':
